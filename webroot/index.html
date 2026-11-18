@@ -33,6 +33,9 @@
   #status[data-state="exposed"] { --c: var(--bad); }
   .headline { display: flex; align-items: center; gap: 10px; font-size: 18px; font-weight: 600; }
   .dot { width: 12px; height: 12px; border-radius: 50%; background: var(--c); box-shadow: 0 0 0 4px color-mix(in srgb, var(--c) 20%, transparent); flex: none; }
+  #status[aria-busy="true"] { --c: var(--accent); }
+  #status[aria-busy="true"] .dot { animation: pulse 1s ease-in-out infinite alternate; }
+  @keyframes pulse { to { opacity: .25; } }
   #detail { color: var(--muted); margin: -6px 0 0; }
   #connect { display: flex; align-items: center; gap: 8px; background: var(--bg); border-radius: 10px; padding: 4px 4px 4px 12px; }
   #connect[hidden] { display: none; }
@@ -87,15 +90,27 @@
   const $ = (id) => document.getElementById(id);
   let busy = false;
   let last;
+  let gen = 0; // Bumped by every action so older status results are dropped.
+  let loading = -1; // Generation of the status call in flight.
+  let calls = 0;
 
-  function exec(cmd) {
+  // ksu.exec blocks the page until the command finishes, so use ksu.spawn, which
+  // streams output lines to window[name] and reports the exit code asynchronously.
+  function ctl(...args) {
     return new Promise((resolve) => {
-      const cb = `exec_cb_${Date.now()}_${Math.random().toString(36).slice(2)}`;
-      window[cb] = (errno, stdout, stderr) => {
-        delete window[cb];
-        resolve({ errno, stdout, stderr });
+      const name = `ctl_${Date.now()}_${calls++}`;
+      const out = [];
+      const stream = { emit: (_, line) => out.push(line) };
+      window[name] = {
+        stdout: stream,
+        stderr: stream,
+        emit(event, code) {
+          if (event !== "exit") return;
+          delete window[name];
+          resolve({ code, output: out.join("\n").trim() });
+        },
       };
-      ksu.exec(cmd, "{}", cb);
+      ksu.spawn("sh", JSON.stringify([CTL, ...args]), "{}", name);
     });
   }
 
@@ -119,6 +134,7 @@
     $("apply").textContent = apply;
     $("apply").hidden = !apply;
     $("disable").hidden = s.state === "off";
+    $("disable").textContent = "Disable";
     $("port").textContent = s.port;
 
     const cmd = s.address ? `adb connect ${s.address}:${s.port}` : "";
@@ -154,27 +170,41 @@
   }
 
   async function refresh() {
-    const r = await exec(`sh ${CTL} status`);
-    if (r.errno === 0) {
-      try { render(JSON.parse(r.stdout)); return; } catch {}
+    const g = gen;
+    if (loading === g) return;
+    loading = g;
+    const r = await ctl("status");
+    if (loading === g) loading = -1;
+    if (busy || g !== gen) return;
+    if (r.code === 0) {
+      try { render(JSON.parse(r.output)); return; } catch {}
     }
     $("title").textContent = "Error";
-    $("log").textContent = r.stderr || r.stdout || `Status failed (${r.errno})`;
+    $("log").textContent = r.output || `Status failed (${r.code})`;
   }
 
-  async function run(args) {
+  // Disables every control and shows what is happening before the command runs.
+  async function run(label, button, ...args) {
     busy = true;
+    gen++;
     if (last) render(last);
+    $("status").ariaBusy = "true";
+    $("title").textContent = label;
+    if (button) button.textContent = label;
     $("log").textContent = "";
-    const r = await exec(`sh ${CTL} ${args}`);
-    if (r.errno !== 0) $("log").textContent = [r.stdout, r.stderr].map((t) => t.trim()).filter(Boolean).join("\n");
+    const r = await ctl(...args);
+    if (r.code !== 0) $("log").textContent = r.output;
     busy = false;
+    $("status").ariaBusy = "false";
     await refresh();
   }
 
-  $("apply").addEventListener("click", () => run("enable"));
-  $("disable").addEventListener("click", () => run("disable"));
-  $("ifaces").addEventListener("change", (e) => run(`set-iface ${shellQuote(e.target.value)}`));
+  $("apply").addEventListener("click", (e) => run(last?.state === "off" ? "Enabling…" : "Applying…", e.currentTarget, "enable"));
+  $("disable").addEventListener("click", (e) => run("Disabling…", e.currentTarget, "disable"));
+  $("ifaces").addEventListener("change", (e) => {
+    const name = e.target.value === "tailscale" ? "Tailscale" : e.target.value;
+    run(`Switching to ${name}…`, null, "set-iface", shellQuote(e.target.value));
+  });
   $("copy").addEventListener("click", async () => {
     const text = $("cmd").textContent;
     try {
