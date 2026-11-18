@@ -1,0 +1,6 @@
+id=adb_tailscale_toggle
+name=ADB over Tailscale Toggle
+version=1.2
+versionCode=3
+author=Local
+description=[ADB TCP: ⚠️ ON, Firewall: ❌ INCOMPLETE] Port 5555 is not fully restricted to Tailscale · Tap Action to repair.
