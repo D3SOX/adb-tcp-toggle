@@ -1,6 +1,6 @@
 #!/system/bin/sh
 
-# Status refresh only. This does NOT enable ADB TCP and does NOT modify firewall rules.
+# Status refresh only: never enables ADB TCP or touches the firewall.
 MODDIR=${0%/*}
-. "$MODDIR/status.sh"
+. "$MODDIR/lib.sh"
 update_status

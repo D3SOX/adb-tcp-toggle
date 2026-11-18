@@ -1,0 +1,183 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<title>ADB over Network</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --card: #fff; --fg: #15181d; --muted: #5d6573; --line: #e2e5ea;
+    --accent: #2f6fdb; --on: #1f8a4c; --off: #6b7280; --warn: #b7791f; --bad: #c53030;
+    font-family: system-ui, Roboto, sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0f1115; --card: #181b21; --fg: #e8eaee; --muted: #9aa3b2; --line: #2a2f38;
+      --accent: #7aa7ff; --on: #4ccb80; --off: #8b93a1; --warn: #f0b44c; --bad: #ff6b6b;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg); font-size: 15px; line-height: 1.4;
+    padding: calc(env(safe-area-inset-top) + 20px) 16px calc(env(safe-area-inset-bottom) + 24px);
+  }
+  main { max-width: 560px; margin: 0 auto; display: grid; gap: 16px; }
+  h1 { font-size: 22px; font-weight: 600; margin: 4px 4px 0; }
+  h2 { font-size: 13px; font-weight: 600; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 8px 4px 0; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 16px; padding: 16px; }
+
+  #status { display: grid; gap: 14px; --c: var(--off); }
+  #status[data-state="on"] { --c: var(--on); }
+  #status[data-state="stale"] { --c: var(--warn); }
+  #status[data-state="exposed"] { --c: var(--bad); }
+  .headline { display: flex; align-items: center; gap: 10px; font-size: 18px; font-weight: 600; }
+  .dot { width: 12px; height: 12px; border-radius: 50%; background: var(--c); box-shadow: 0 0 0 4px color-mix(in srgb, var(--c) 20%, transparent); flex: none; }
+  #detail { color: var(--muted); margin: -6px 0 0; }
+  #connect { display: flex; align-items: center; gap: 8px; background: var(--bg); border-radius: 10px; padding: 4px 4px 4px 12px; }
+  #connect[hidden] { display: none; }
+  #connect code { flex: 1; min-width: 0; overflow-wrap: anywhere; font-size: 14px; }
+
+  button { font: inherit; border: 0; border-radius: 999px; cursor: pointer; }
+  button:disabled { opacity: .5; cursor: default; }
+  #toggle { background: var(--accent); color: var(--card); font-weight: 600; padding: 12px; width: 100%; }
+  #status[data-state="on"] #toggle { background: transparent; color: var(--fg); box-shadow: inset 0 0 0 1px var(--line); }
+  #copy { background: transparent; color: var(--accent); font-weight: 600; padding: 8px 12px; flex: none; }
+
+  #ifaces { padding: 4px 0; }
+  label { display: flex; align-items: center; gap: 14px; padding: 12px 16px; cursor: pointer; }
+  label + label { border-top: 1px solid var(--line); }
+  input[type="radio"] { accent-color: var(--accent); width: 20px; height: 20px; margin: 0; flex: none; }
+  .name { font-weight: 600; display: flex; align-items: center; gap: 8px; }
+  .tag { font-size: 11px; font-weight: 600; color: var(--accent); background: color-mix(in srgb, var(--accent) 14%, transparent); border-radius: 6px; padding: 1px 6px; }
+  .sub { color: var(--muted); font-size: 13px; overflow-wrap: anywhere; }
+  label > div { min-width: 0; }
+
+  #log { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 13px; color: var(--bad); }
+  #log:empty { display: none; }
+  footer { color: var(--muted); font-size: 13px; margin: 0 4px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>ADB over Network</h1>
+
+  <section id="status" class="card" data-state="off" aria-live="polite">
+    <div class="headline"><span class="dot"></span><span id="title">Loading…</span></div>
+    <p id="detail"></p>
+    <div id="connect" hidden><code id="cmd"></code><button id="copy" type="button">Copy</button></div>
+    <button id="toggle" type="button" disabled>…</button>
+    <pre id="log"></pre>
+  </section>
+
+  <h2>Allow connections via</h2>
+  <form id="ifaces" class="card"></form>
+
+  <footer>Only the selected interface can reach port <span id="port">5555</span>. TCP ADB turns off on reboot, and devices still need ADB authorization.</footer>
+</main>
+
+<script>
+  const CTL = "/data/adb/modules/adb_tcp_toggle/ctl.sh";
+  const $ = (id) => document.getElementById(id);
+  let busy = false;
+  let last;
+
+  function exec(cmd) {
+    return new Promise((resolve) => {
+      const cb = `exec_cb_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+      window[cb] = (errno, stdout, stderr) => {
+        delete window[cb];
+        resolve({ errno, stdout, stderr });
+      };
+      ksu.exec(cmd, "{}", cb);
+    });
+  }
+
+  const shellQuote = (s) => `'${s.replaceAll("'", `'\\''`)}'`;
+
+  const TEXT = {
+    off: ["Off", () => "TCP ADB is disabled.", "Enable"],
+    on: ["On", (s) => `Reachable only via ${s.target}.`, "Disable"],
+    stale: ["Unreachable", (s) => `Firewalled to ${s.firewall}, but the selected interface is ${s.target ? `now ${s.target}` : "not available"}.`, "Re-apply"],
+    exposed: ["Exposed", (s) => `adbd listens on port ${s.port} on every interface. Something else enabled TCP ADB.`, "Restrict to selected interface"],
+  };
+
+  function render(s) {
+    last = s;
+    const [title, detail, action] = TEXT[s.state] ?? TEXT.off;
+    $("status").dataset.state = s.state;
+    $("title").textContent = title;
+    $("detail").textContent = detail(s);
+    $("toggle").textContent = action;
+    $("port").textContent = s.port;
+
+    const cmd = s.address ? `adb connect ${s.address}:${s.port}` : "";
+    $("cmd").textContent = cmd;
+    $("connect").hidden = !cmd;
+
+    const ts = s.interfaces.find((i) => i.name === s.tailscale);
+    const options = [{
+      value: "tailscale",
+      name: "Tailscale",
+      tag: "auto",
+      sub: ts ? `Currently ${ts.name} · ${ts.addresses.join(", ")}` : "Not running",
+    }];
+    for (const i of s.interfaces) {
+      options.push({ value: i.name, name: i.name, tag: i.name === s.tailscale ? "Tailscale" : "", sub: i.addresses.join(", ") });
+    }
+    if (!options.some((o) => o.value === s.iface)) {
+      options.push({ value: s.iface, name: s.iface, tag: "", sub: "Not present" });
+    }
+
+    const form = $("ifaces");
+    form.replaceChildren(...options.map((o) => {
+      const label = document.createElement("label");
+      const radio = Object.assign(document.createElement("input"), { type: "radio", name: "iface", value: o.value, checked: o.value === s.iface, disabled: busy });
+      const text = document.createElement("div");
+      const name = Object.assign(document.createElement("div"), { className: "name", textContent: o.name });
+      if (o.tag) name.append(Object.assign(document.createElement("span"), { className: "tag", textContent: o.tag }));
+      text.append(name, Object.assign(document.createElement("div"), { className: "sub", textContent: o.sub }));
+      label.append(radio, text);
+      return label;
+    }));
+    $("toggle").disabled = busy;
+  }
+
+  async function refresh() {
+    const r = await exec(`sh ${CTL} status`);
+    if (r.errno === 0) {
+      try { render(JSON.parse(r.stdout)); return; } catch {}
+    }
+    $("title").textContent = "Error";
+    $("log").textContent = r.stderr || r.stdout || `Status failed (${r.errno})`;
+  }
+
+  async function run(args) {
+    busy = true;
+    if (last) render(last);
+    $("log").textContent = "";
+    const r = await exec(`sh ${CTL} ${args}`);
+    if (r.errno !== 0) $("log").textContent = (r.stdout + r.stderr).trim();
+    busy = false;
+    await refresh();
+  }
+
+  $("toggle").addEventListener("click", () => run(last?.state === "on" ? "disable" : "enable"));
+  $("ifaces").addEventListener("change", (e) => run(`set-iface ${shellQuote(e.target.value)}`));
+  $("copy").addEventListener("click", async () => {
+    const text = $("cmd").textContent;
+    try {
+      await navigator.clipboard.writeText(text);
+    } catch {
+      getSelection().selectAllChildren($("cmd"));
+      document.execCommand("copy");
+    }
+    ksu.toast("Copied");
+  });
+
+  refresh();
+  setInterval(() => { if (!busy && !document.hidden) refresh(); }, 3000);
+  document.addEventListener("visibilitychange", () => { if (!document.hidden && !busy) refresh(); });
+</script>
+</body>
+</html>
