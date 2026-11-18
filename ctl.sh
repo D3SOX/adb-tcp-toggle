@@ -4,25 +4,30 @@
 MODDIR=${0%/*}
 . "$MODDIR/lib.sh"
 
-json_str() {
-    printf '"%s"' "$(printf '%s' "$1" | sed 's/[\\"]/\\&/g')"
-}
-
+# Interface names and addresses never contain quotes or backslashes, so the
+# values need no JSON escaping.
 status_json() {
     read_state
-    printf '{"state":%s,"port":%s,"iface":%s,"target":%s,"firewall":%s,"address":%s,"tailscale":%s,"interfaces":[' \
-        "$(json_str "$STATE")" "$PORT" "$(json_str "$(conf_iface)")" "$(json_str "$TARGET")" \
-        "$(json_str "$FWIF")" "$(json_str "$ADDR")" "$(json_str "$(tailscale_iface)")"
-    iface_addrs | awk '
-        function q(s) { gsub(/[\\"]/, "\\\\&", s); return "\"" s "\"" }
-        $1 != cur {
-            if (cur != "") printf "]},"
-            cur = $1; n = 0
-            printf "{\"name\":%s,\"addresses\":[", q($1)
-        }
-        { printf "%s%s", (n++ ? "," : ""), q($3) }
-        END { if (cur != "") printf "]}" }'
-    printf ']}\n'
+    list='' cur=''
+    set -f
+    IFS=$NL
+    for line in $ADDRS; do
+        IFS=' '
+        # shellcheck disable=SC2086
+        set -- $line
+        IFS=$NL
+        if [ "$1" = "$cur" ]; then
+            list="$list,\"$3\""
+        else
+            [ -n "$cur" ] && list="$list]},"
+            list="$list{\"name\":\"$1\",\"addresses\":[\"$3\""
+            cur=$1
+        fi
+    done
+    unset IFS
+    set +f
+    [ -n "$cur" ] && list="$list]}"
+    echo "{\"state\":\"$STATE\",\"port\":$PORT,\"iface\":\"$CONF_IFACE\",\"target\":\"$TARGET\",\"firewall\":\"$FWIF\",\"address\":\"$ADDR\",\"tailscale\":\"$TS_IFACE\",\"interfaces\":[$list]}"
 }
 
 case "$1" in

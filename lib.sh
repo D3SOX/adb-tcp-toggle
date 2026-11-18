@@ -13,19 +13,31 @@ IPT="$(command -v iptables 2>/dev/null)"
 IP6T="$(command -v ip6tables 2>/dev/null)"
 
 # --- configuration -----------------------------------------------------------
+#
+# Process starts cost tens of milliseconds on Android, and the WebUI polls the
+# status, so the helpers below parse with shell builtins and set variables
+# instead of piping through awk or sed.
 
-# Configured interface: "tailscale" (auto-detect) or a fixed interface name.
-conf_iface() {
-    v=
-    [ -f "$CONF" ] && v="$(sed -n 's/^IFACE=//p' "$CONF" | head -n 1)"
-    valid_iface_name "$v" && echo "$v" || echo "$IFACE_AUTO"
-}
+NL='
+'
+PORT_HEX=15B3 # $PORT as it appears in /proc/net/tcp
 
 valid_iface_name() {
     case "$1" in
         '' | *[!A-Za-z0-9._@-]*) return 1 ;;
     esac
     [ "${#1}" -le 15 ]
+}
+
+# Sets CONF_IFACE: "tailscale" (auto-detect) or a fixed interface name.
+load_conf() {
+    CONF_IFACE=$IFACE_AUTO
+    [ -f "$CONF" ] || return 0
+    while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in
+            IFACE=*) valid_iface_name "${line#IFACE=}" && CONF_IFACE=${line#IFACE=} ;;
+        esac
+    done < "$CONF"
 }
 
 conf_set_iface() {
@@ -35,48 +47,91 @@ conf_set_iface() {
 
 # --- interfaces --------------------------------------------------------------
 
-# Prints "name family address" for every non-loopback, non-link-local address.
-iface_addrs() {
-    ip -o addr show 2>/dev/null |
-        awk '$2 != "lo" && tolower($4) !~ /^fe80:/ { sub(/\/.*/, "", $4); sub(/@.*/, "", $2); print $2, $3, $4 }'
+# Sets ADDRS to "name family address" lines for every non-loopback,
+# non-link-local address.
+load_addrs() {
+    ADDRS=
+    out="$(ip -o addr show 2>/dev/null)"
+    set -f
+    IFS=$NL
+    for line in $out; do
+        IFS=' 	'
+        # shellcheck disable=SC2086
+        set -- $line
+        IFS=$NL
+        [ "$2" = lo ] && continue
+        case "$4" in fe80:* | FE80:*) continue ;; esac
+        ADDRS="$ADDRS${2%%@*} $3 ${4%%/*}$NL"
+    done
+    unset IFS
+    set +f
 }
 
 # Android names VPN interfaces tun0, tun1, ... in creation order, so Tailscale's
 # name changes. Identify it by its address ranges instead: fd7a:115c:a1e0::/48 or
 # 100.64.0.0/10 on a tun interface (carriers also hand out 100.64/10 on rmnet).
-tailscale_iface() {
-    iface_addrs | awk '
-        $1 !~ /^tun/ { next }
-        $2 == "inet6" && tolower($3) ~ /^fd7a:115c:a1e0:/ { print $1; exit }
-        $2 == "inet" {
-            split($3, o, ".")
-            if (o[1] == 100 && o[2] >= 64 && o[2] <= 127) { print $1; exit }
-        }'
+# Sets TS_IFACE.
+find_tailscale() {
+    TS_IFACE=
+    set -f
+    IFS=$NL
+    for line in $ADDRS; do
+        IFS=' '
+        # shellcheck disable=SC2086
+        set -- $line
+        IFS=$NL
+        case "$1" in tun*) ;; *) continue ;; esac
+        case "$2 $3" in
+            "inet6 fd7a:115c:a1e0:"* | "inet 100.6"[4-9].* | "inet 100."[7-9][0-9].* | \
+            "inet 100.1"[01][0-9].* | "inet 100.12"[0-7].*)
+                TS_IFACE=$1
+                break
+                ;;
+        esac
+    done
+    unset IFS
+    set +f
 }
 
-# Interface ADB should be restricted to right now, empty if unavailable.
-target_iface() {
-    c="$(conf_iface)"
-    if [ "$c" = "$IFACE_AUTO" ]; then
-        tailscale_iface
-    elif ip link show dev "$c" >/dev/null 2>&1; then
-        echo "$c"
+# Sets TARGET: the interface ADB should be restricted to now, empty if missing.
+resolve_target() {
+    TARGET=
+    if [ "$CONF_IFACE" = "$IFACE_AUTO" ]; then
+        TARGET=$TS_IFACE
+    elif [ -e "/sys/class/net/$CONF_IFACE" ]; then
+        TARGET=$CONF_IFACE
     fi
 }
 
-# Preferred address to connect to: IPv4 first, then IPv6.
+# Sets IFACE_IP to the address to connect to on $1: IPv4 first, then IPv6.
 iface_ip() {
-    iface_addrs | awk -v i="$1" '
-        $1 != i { next }
-        $2 == "inet" { print $3; found = 1; exit }
-        $2 == "inet6" && v6 == "" { v6 = $3 }
-        END { if (!found && v6 != "") print "[" v6 "]" }'
+    IFACE_IP=
+    want=$1
+    set -f
+    IFS=$NL
+    for line in $ADDRS; do
+        IFS=' '
+        # shellcheck disable=SC2086
+        set -- $line
+        IFS=$NL
+        [ "$1" = "$want" ] || continue
+        if [ "$2" = inet ]; then IFACE_IP=$3; break; fi
+        [ -z "$IFACE_IP" ] && IFACE_IP="[$3]"
+    done
+    unset IFS
+    set +f
 }
 
 # --- adbd --------------------------------------------------------------------
 
 is_listening() {
-    ss -lnt 2>/dev/null | awk -v p=":$PORT" '$4 ~ p "$" { f = 1 } END { exit !f }'
+    for f in /proc/net/tcp /proc/net/tcp6; do
+        [ -r "$f" ] || continue
+        while read -r _ local _ st _; do
+            [ "$st" = 0A ] && case "$local" in *:"$PORT_HEX") return 0 ;; esac
+        done < "$f"
+    done
+    return 1
 }
 
 # Waits up to ~5 s for the listener to reach the wanted state (0 or 1).
@@ -99,21 +154,39 @@ restart_adbd() {
 
 # --- firewall ----------------------------------------------------------------
 
-# Interface allowed by our chain in one family, empty if the chain is incomplete.
+# Sets FAMILY_IF to the interface our chain allows in one family, empty unless
+# INPUT jumps to the chain and it holds exactly "ACCEPT on <iface>, DROP".
 fw_family_iface() {
+    FAMILY_IF=
     [ -n "$1" ] || return 0
-    "$1" -C INPUT -p tcp --dport "$PORT" -j "$CHAIN" 2>/dev/null || return 0
-    "$1" -S "$CHAIN" 2>/dev/null | awk -v c="$CHAIN" '
-        $0 == "-A " c " -j DROP" { drop = NR }
-        $1 == "-A" && $3 == "-i" && $5 == "-j" && $6 == "ACCEPT" && NF == 6 { acc = NR; i = $4 }
-        END { if (acc && drop > acc) print i }'
+    out="$("$1" -S 2>/dev/null)"
+    jump='' rules=''
+    set -f
+    IFS=$NL
+    for line in $out; do
+        case "$line" in
+            "-A INPUT -p tcp -m tcp --dport $PORT -j $CHAIN") jump=1 ;;
+            "-A $CHAIN "*) rules="$rules${line#"-A $CHAIN "}$NL" ;;
+        esac
+    done
+    unset IFS
+    set +f
+    [ -n "$jump" ] || return 0
+    case "$rules" in
+        "-i "*" -j ACCEPT$NL-j DROP$NL")
+            FAMILY_IF=${rules#-i }
+            FAMILY_IF=${FAMILY_IF%%" -j ACCEPT$NL"*}
+            ;;
+    esac
 }
 
-# Interface the firewall allows, empty unless IPv4 and IPv6 agree.
+# Sets FWIF to the interface the firewall allows, empty unless IPv4 and IPv6 agree.
 fw_iface() {
-    v4="$(fw_family_iface "$IPT")"
-    v6="$(fw_family_iface "$IP6T")"
-    [ -n "$v4" ] && [ "$v4" = "$v6" ] && echo "$v4"
+    fw_family_iface "$IPT"
+    v4=$FAMILY_IF
+    fw_family_iface "$IP6T"
+    FWIF=
+    [ -n "$v4" ] && [ "$v4" = "$FAMILY_IF" ] && FWIF=$v4
 }
 
 fw_family_remove() {
@@ -146,25 +219,32 @@ fw_apply() {
 
 # --- state -------------------------------------------------------------------
 
-# Sets STATE (off | on | stale | exposed), TARGET, FWIF and ADDR.
+# Sets STATE (off | on | stale | exposed) plus CONF_IFACE, ADDRS, TS_IFACE,
+# TARGET, FWIF and ADDR.
 read_state() {
-    TARGET="$(target_iface)"
-    FWIF="$(fw_iface)"
-    ADDR=
+    load_conf
+    load_addrs
+    find_tailscale
+    resolve_target
+    FWIF='' ADDR=''
     if ! is_listening; then
         STATE=off
-    elif [ -z "$FWIF" ]; then
+        return
+    fi
+    fw_iface
+    if [ -z "$FWIF" ]; then
         STATE=exposed
     elif [ -n "$TARGET" ] && [ "$FWIF" = "$TARGET" ]; then
         STATE=on
-        ADDR="$(iface_ip "$TARGET")"
+        iface_ip "$TARGET"
+        ADDR=$IFACE_IP
     else
         STATE=stale
     fi
 }
 
 iface_label() {
-    if [ "$1" = "$IFACE_AUTO" ]; then echo "Tailscale"; else echo "$1"; fi
+    if [ "$CONF_IFACE" = "$IFACE_AUTO" ]; then echo "Tailscale"; else echo "$CONF_IFACE"; fi
 }
 
 write_description() {
@@ -176,7 +256,7 @@ write_description() {
 
 update_status() {
     read_state
-    label="$(iface_label "$(conf_iface)")"
+    label="$(iface_label)"
     case "$STATE" in
         on) write_description "✅ ADB TCP on, $label only: ${ADDR:-$TARGET}:$PORT" ;;
         off) write_description "❌ ADB TCP off. Action enables it on $label." ;;
@@ -203,13 +283,13 @@ enable_tcp_adb() {
         return 1
     fi
 
-    c="$(conf_iface)"
-    iface="$(target_iface)"
+    read_state
+    iface=$TARGET
     if [ -z "$iface" ]; then
-        if [ "$c" = "$IFACE_AUTO" ]; then
+        if [ "$CONF_IFACE" = "$IFACE_AUTO" ]; then
             echo "ERROR: no Tailscale interface found. Start Tailscale first."
         else
-            echo "ERROR: interface $c is not present."
+            echo "ERROR: interface $CONF_IFACE is not present."
         fi
         echo "ADB TCP was NOT enabled."
         return 1
@@ -241,7 +321,8 @@ enable_tcp_adb() {
     fi
 
     echo "ADB TCP: ON, only via $iface"
-    echo "Connect: adb connect $(iface_ip "$iface"):$PORT"
+    iface_ip "$iface"
+    echo "Connect: adb connect $IFACE_IP:$PORT"
 }
 
 disable_tcp_adb() {
