@@ -1,7 +1,7 @@
 id=adb_tcp_toggle
 name=ADB over Network Toggle
-version=2.0.0
-versionCode=4
+version=2.0.1
+versionCode=5
 author=D3SOX
 description=❌ ADB TCP off. Action enables it on Tailscale.
 updateJson=https://github.com/D3SOX/adb-tcp-toggle/releases/latest/download/update.json
