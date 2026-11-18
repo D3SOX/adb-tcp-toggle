@@ -6,6 +6,9 @@ CHAIN=ADBTCPTOGGLE
 CONF=/data/adb/adb_tcp_toggle.conf
 IFACE_AUTO=tailscale
 
+# WebUI shells don't get the root manager's bin directory (resetprop) in PATH.
+PATH="$PATH:/data/adb/ap/bin:/data/adb/ksu/bin:/data/adb/magisk"
+
 IPT="$(command -v iptables 2>/dev/null)"
 IP6T="$(command -v ip6tables 2>/dev/null)"
 
@@ -177,8 +180,18 @@ update_status() {
     case "$STATE" in
         on) write_description "✅ ADB TCP on, $label only: ${ADDR:-$TARGET}:$PORT" ;;
         off) write_description "❌ ADB TCP off. Action enables it on $label." ;;
-        stale) write_description "⚠️ ADB TCP on, but firewalled to $FWIF while $label is ${TARGET:-unavailable}. Action re-applies." ;;
-        exposed) write_description "🚨 ADB TCP on port $PORT without firewall! Action restricts it to $label." ;;
+        stale)
+            if [ -n "$TARGET" ]; then
+                write_description "⚠️ ADB TCP on, but firewalled to $FWIF while $label is $TARGET. Action re-applies."
+            else
+                write_description "⚠️ ADB TCP on, but $label is unavailable, so it can't be reached. Action disables it."
+            fi ;;
+        exposed)
+            if [ -n "$TARGET" ]; then
+                write_description "🚨 ADB TCP on port $PORT without firewall! Action restricts it to $label."
+            else
+                write_description "🚨 ADB TCP on port $PORT without firewall! Action disables it."
+            fi ;;
     esac
 }
 
@@ -246,9 +259,13 @@ disable_tcp_adb() {
     echo "ADB TCP: OFF (USB ADB is unaffected)"
 }
 
-# Disables when correctly on; otherwise enables, which also repairs a stale or
-# exposed listener.
+# Off enables and on disables. A stale or exposed listener is re-firewalled
+# when the selected interface exists, and disabled otherwise.
 toggle_tcp_adb() {
     read_state
-    if [ "$STATE" = on ]; then disable_tcp_adb; else enable_tcp_adb; fi
+    case "$STATE" in
+        off) enable_tcp_adb ;;
+        on) disable_tcp_adb ;;
+        *) if [ -n "$TARGET" ]; then enable_tcp_adb; else disable_tcp_adb; fi ;;
+    esac
 }

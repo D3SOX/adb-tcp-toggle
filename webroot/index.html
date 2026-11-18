@@ -40,8 +40,11 @@
 
   button { font: inherit; border: 0; border-radius: 999px; cursor: pointer; }
   button:disabled { opacity: .5; cursor: default; }
-  #toggle { background: var(--accent); color: var(--card); font-weight: 600; padding: 12px; width: 100%; }
-  #status[data-state="on"] #toggle { background: transparent; color: var(--fg); box-shadow: inset 0 0 0 1px var(--line); }
+  .actions { display: flex; gap: 8px; }
+  .actions button { flex: 1; font-weight: 600; padding: 12px; }
+  .actions button[hidden] { display: none; }
+  #apply { background: var(--accent); color: var(--card); }
+  #disable { background: transparent; color: var(--fg); box-shadow: inset 0 0 0 1px var(--line); }
   #copy { background: transparent; color: var(--accent); font-weight: 600; padding: 8px 12px; flex: none; }
 
   #ifaces { padding: 4px 0; }
@@ -66,7 +69,10 @@
     <div class="headline"><span class="dot"></span><span id="title">Loading…</span></div>
     <p id="detail"></p>
     <div id="connect" hidden><code id="cmd"></code><button id="copy" type="button">Copy</button></div>
-    <button id="toggle" type="button" disabled>…</button>
+    <div class="actions">
+      <button id="apply" type="button" disabled>Enable</button>
+      <button id="disable" type="button" hidden>Disable</button>
+    </div>
     <pre id="log"></pre>
   </section>
 
@@ -97,9 +103,9 @@
 
   const TEXT = {
     off: ["Off", () => "TCP ADB is disabled.", "Enable"],
-    on: ["On", (s) => `Reachable only via ${s.target}.`, "Disable"],
+    on: ["On", (s) => `Reachable only via ${s.target}.`, ""],
     stale: ["Unreachable", (s) => `Firewalled to ${s.firewall}, but the selected interface is ${s.target ? `now ${s.target}` : "not available"}.`, "Re-apply"],
-    exposed: ["Exposed", (s) => `adbd listens on port ${s.port} on every interface. Something else enabled TCP ADB.`, "Restrict to selected interface"],
+    exposed: ["Exposed", (s) => `adbd listens on port ${s.port} on every interface. Something else enabled TCP ADB.`, "Restrict"],
   };
 
   function render(s) {
@@ -108,7 +114,11 @@
     $("status").dataset.state = s.state;
     $("title").textContent = title;
     $("detail").textContent = detail(s);
-    $("toggle").textContent = action;
+    // Re-applying needs the selected interface; disabling always works.
+    const apply = s.state === "off" || (action && s.target) ? action : "";
+    $("apply").textContent = apply;
+    $("apply").hidden = !apply;
+    $("disable").hidden = s.state === "off";
     $("port").textContent = s.port;
 
     const cmd = s.address ? `adb connect ${s.address}:${s.port}` : "";
@@ -140,7 +150,7 @@
       label.append(radio, text);
       return label;
     }));
-    $("toggle").disabled = busy;
+    $("apply").disabled = $("disable").disabled = busy;
   }
 
   async function refresh() {
@@ -157,12 +167,13 @@
     if (last) render(last);
     $("log").textContent = "";
     const r = await exec(`sh ${CTL} ${args}`);
-    if (r.errno !== 0) $("log").textContent = (r.stdout + r.stderr).trim();
+    if (r.errno !== 0) $("log").textContent = [r.stdout, r.stderr].map((t) => t.trim()).filter(Boolean).join("\n");
     busy = false;
     await refresh();
   }
 
-  $("toggle").addEventListener("click", () => run(last?.state === "on" ? "disable" : "enable"));
+  $("apply").addEventListener("click", () => run("enable"));
+  $("disable").addEventListener("click", () => run("disable"));
   $("ifaces").addEventListener("change", (e) => run(`set-iface ${shellQuote(e.target.value)}`));
   $("copy").addEventListener("click", async () => {
     const text = $("cmd").textContent;

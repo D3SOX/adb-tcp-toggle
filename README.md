@@ -2,7 +2,7 @@
 
 An APatch/KernelSU module that turns TCP ADB (port 5555) on and off. Connections are only accepted on one network interface you choose. IPv4 and IPv6 firewall rules drop all other traffic to the port.
 
-- **Action button.** Toggles TCP ADB. If adbd is already listening without the firewall, or the firewall points at an old interface, the Action button fixes it instead of turning ADB off.
+- **Action button.** Toggles TCP ADB. If adbd is already listening without the firewall, or the firewall points at an old interface, the Action button fixes it instead of turning ADB off. If the selected interface isn't available, it turns ADB off.
 - **WebUI.** Shows the live status and the `adb connect` address, and lets you choose the interface.
 - **Module description.** Shows the status. The module refreshes it after every change and at boot.
 
@@ -17,7 +17,7 @@ The default, **Tailscale (auto)**, finds the Tailscale interface by its address 
 
 You can also pick a fixed interface, for example `wlan0` for LAN access. The module saves the choice in `/data/adb/adb_tcp_toggle.conf`.
 
-If Tailscale reconnects on a different `tun` interface while ADB is on, the port stays firewalled to the old interface and can't be reached. The status shows "Unreachable" until you press Action or Re-apply.
+If Tailscale reconnects on a different `tun` interface while ADB is on, the port stays firewalled to the old interface and can't be reached. The status shows "Unreachable" until you press Action or Re-apply. If Tailscale is off, Action and the WebUI's Disable button turn TCP ADB off.
 
 ## Safety
 
